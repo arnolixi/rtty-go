@@ -58,16 +58,21 @@ var msgHandlers = map[byte]func(*RttyClient, []byte) error{
 }
 
 func (cli *RttyClient) Run() {
-	defer func() {
-		cli.Close()
+	for {
+		cli.run()
 
-		if cli.cfg.reconnect {
-			delay := rand.IntN(10) + 5
-			log.Error().Msgf("Reconnecting in %d seconds...", delay)
-			time.Sleep(time.Duration(delay) * time.Second)
-			cli.Run()
+		if !cli.cfg.reconnect {
+			break
 		}
-	}()
+
+		delay := rand.IntN(10) + 5
+		log.Error().Msgf("Reconnecting in %d seconds...", delay)
+		time.Sleep(time.Duration(delay) * time.Second)
+	}
+}
+
+func (cli *RttyClient) run() {
+	defer cli.Close()
 
 	err := cli.Connect()
 	if err != nil {
@@ -306,6 +311,7 @@ func handleLoginMsg(cli *RttyClient, data []byte) error {
 
 	var retCode byte
 
+	cli.mu.Lock()
 	if cli.ntty == rttyTermLimit {
 		log.Error().Msgf("maximum number of TTYs reached: %d", cli.ntty)
 		retCode = 1
@@ -332,6 +338,7 @@ func handleLoginMsg(cli *RttyClient, data []byte) error {
 			go s.Run(cli)
 		}
 	}
+	cli.mu.Unlock()
 
 	cli.WriteMsg(proto.MsgTypeLogin, sid, retCode)
 
@@ -345,15 +352,15 @@ func handleLogoutMsg(cli *RttyClient, data []byte) error {
 		log.Info().Msgf("delete tty %s", sid)
 		s := val.(*TermSession)
 
+		s.term.Close()
+
 		s.mu.Lock()
 		if s.timer != nil {
 			s.timer.Stop()
 			s.timer = nil
 		}
-		s.mu.Unlock()
-
-		s.term.Close()
 		cli.ntty--
+		s.mu.Unlock()
 	} else {
 		log.Error().Msgf("tty session %s not found", sid)
 		return nil
@@ -448,7 +455,9 @@ func (s *TermSession) Run(cli *RttyClient) {
 	})
 	s.mu.Unlock()
 
-	io.Copy(s, s.term)
+	if _, err := io.Copy(s, s.term); err != nil {
+		log.Error().Err(err).Msgf("error while copying terminal data for %s", s.sid)
+	}
 	s.close(cli)
 }
 
@@ -466,18 +475,17 @@ func (s *TermSession) close(cli *RttyClient) {
 		return
 	}
 
+	cli.WriteMsg(proto.MsgTypeLogout, s.sid)
+
+	s.term.Close()
+
 	s.mu.Lock()
 	if s.timer != nil {
 		s.timer.Stop()
 		s.timer = nil
 	}
-	s.mu.Unlock()
-
-	cli.WriteMsg(proto.MsgTypeLogout, s.sid)
-
-	s.term.Close()
-
 	cli.ntty--
+	s.mu.Unlock()
 
 	log.Info().Msgf("delete tty %s", s.sid)
 }
